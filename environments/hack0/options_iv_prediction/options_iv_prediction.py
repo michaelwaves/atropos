@@ -1,13 +1,13 @@
 import random
 import re
+import pandas as pd
 from typing import Dict, List, Optional, Tuple, Union
 
 import wandb
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from tqdm.asyncio import tqdm_asyncio
 
 from yahooquery import Ticker
-import pandas as pd
 
 from atroposlib.envs.base import (
     APIServerConfig,
@@ -26,17 +26,17 @@ You may use extremely long chains of thought to deeply consider the problem and 
 You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your final prediction."""  # noqa E501
 
 # User message template that contains task instructions
-user_message_template = """Your task is to analyze the following option price, underlying stock price, risk free rate, strike price, 
-                            and time to expiration and predict the implied volatility of the option
+user_message_template =user_message_template = (
+    "Your task is to analyze the following option data and predict the implied volatility of the option.\n\n"
+    "Option Price: ${option_price:.2f}\n"
+    "Stock Price: ${stock_price:.2f}\n"
+    "Strike Price: ${strike_price:.2f}\n"
+    "Time to Expiry: {time_to_expiry:.6f} years\n"
+    "Risk-Free Rate: {risk_free_rate:.2f} \n\n"
+    "Your final answer MUST use the exact format: \"The implied volatility will be: {{answer}}\"\n"
+    "Where {{answer}} is the implied volatility as a string in percent (e.g. 70%)"
+)
 
-Your final answer MUST use the exact format:
-"The implied volatility will be: {{answer}}
-
-Where {{answer}} is the implied volatility as a string in percent (e.g. 70%)
-
-Here is the data to analyze:
-
-{context}"""  # context = {}
 
 
 class OptionsIVPrediction(BaseEnv):
@@ -48,7 +48,7 @@ class OptionsIVPrediction(BaseEnv):
         testing=False,
     ):
         """
-        Initialize the Fundamental Metric Prediction environment.
+        Initialize the Options Implied Volatility Prediction environment.
 
         Args:
             config: Configuration for the base environment
@@ -94,15 +94,63 @@ class OptionsIVPrediction(BaseEnv):
         """
         Set up the environment by loading and preparing the dataset.
         """
-        # Load the full dataset
-        full_dataset = load_dataset('csv', data_files='unh_options.csv')
+        # Use yahooquery to get option data
+        stocks = ['UNH']
+        unh = Ticker(stocks)
+        df = unh.option_chain
+        stock_price = unh.financial_data['UNH']['currentPrice']
+        risk_free_rate = 0.05  # Fixed risk-free rate
 
-        full_dataset = full_dataset.shuffle(seed=42)
-
+        # Process the options data
+        processed_data = []
+        for index, row in df.iterrows():
+            try:
+                option_price = row['lastPrice']
+                strike_price = row['strike']
+                expiry = pd.Timestamp(index[1]) #expiry date
+                now = pd.Timestamp.now()
+                time_to_expiration = (expiry - now).total_seconds() / (365.25 * 24 * 60 * 60)
+                
+                # Skip invalid options
+                if option_price <= 0 or time_to_expiration <= 0:
+                    continue
+                
+                # Get the implied volatility directly from the row
+                iv = row['impliedVolatility']
+                
+                # Format as a percentage
+                iv_percentage = f"{iv * 100:.2f}%"
+                
+                # Create context dictionary
+                context = {
+                    "option_price": option_price,
+                    "strike_price": strike_price,
+                    "time_to_expiry": time_to_expiration,
+                    "risk_free_rate": risk_free_rate,
+                    "stock_price": stock_price
+                }
+                
+                processed_data.append({
+                    'context': context,
+                    'answer': iv_percentage,
+                    'raw_iv': iv * 100,  # Store raw value for scoring
+                })
+            except Exception as e:
+                # Skip any options that cause errors
+                print(row['expiration'])
+                print(f"Skipping option due to error: {e}")
+                continue
+        
+        # Convert to dataset
+        dataset = Dataset.from_dict({
+            'context': [item['context'] for item in processed_data],
+            'answer': [item['answer'] for item in processed_data],
+            'raw_iv': [item['raw_iv'] for item in processed_data],
+        })
+        
         # Create train/test split (95% train, 5% test)
-        split_dataset = full_dataset.train_test_split(test_size=0.05, seed=42)
+        split_dataset = dataset.shuffle(seed=42).train_test_split(test_size=0.05, seed=42)
 
-        # Keep the splits as is - no need to reformat
         self.train = split_dataset["train"]
         self.test = split_dataset["test"]
 
@@ -131,32 +179,23 @@ class OptionsIVPrediction(BaseEnv):
         next_item = self.train[self.iter % len(self.train)]
         self.iter += 1
 
-        # Extract context, answer, magnitude and fundamental metric from the dataset item
+        # Extract context and answer from the dataset item
         context = next_item["context"]
-        option_price = next_item['lastPrice']
-        strike_price = next_item['strike']
-        expiry = next_item[1]
-        now = pd.Timestamp.now()
-        time_to_expiration = (expiry - now).total_seconds() / (365.25 * 24 * 60 * 60)
-        risk_free_rate =  0.05
-        option_type = next_item[2]
+        answer = next_item["answer"]  # IV as percentage string
+        raw_iv = next_item["raw_iv"]  # Raw IV as float
 
-
-
-        print(time_to_expiration)
         # Create prompt tuple using frozensets as required
         prompt = []
 
         # Add system prompt
         prompt.append(frozenset({"role": "system", "content": system_prompt}.items()))
 
-        # Format user message with context and fundamental metric
-        user_content = user_message_template.format(
-            context=context, fundamental_metric=fundamental_metric
-        )
+        # Format user message with context
+        print(context)
+        user_content = user_message_template.format(**context)
         prompt.append(frozenset({"role": "user", "content": user_content}.items()))
 
-        return (tuple(prompt), answer, magnitude, fundamental_metric)
+        return (tuple(prompt), answer, raw_iv)
 
     async def collect_trajectories(self, item) -> Tuple[ScoredDataGroup, List]:
         """
@@ -182,7 +221,7 @@ class OptionsIVPrediction(BaseEnv):
         completions = await self.server.completion(
             prompt=prompt,
             n=self.config.group_size,
-            max_tokens=1024 * 15,
+            max_tokens=1024,
             temperature=0.8,  # Using higher temperature for diverse responses
         )
 
@@ -199,13 +238,12 @@ class OptionsIVPrediction(BaseEnv):
                 {"role": "assistant", "content": completion_choice.text}
             )
 
-            # Add to scoring queue with expected answer, magnitude, and fundamental metric
+            # Add to scoring queue with expected answer and raw IV
             to_score.append(
                 (
                     tuple(trajectory_messages),
-                    item[1],  # answer (maintained/raised/reduced)
-                    item[2],  # magnitude
-                    item[3],  # fundamental_metric
+                    item[1],  # answer (formatted IV percentage)
+                    item[2],  # raw_iv (floating point value)
                 )
             )
 
@@ -215,16 +253,15 @@ class OptionsIVPrediction(BaseEnv):
 
         return scored_data, to_backlog
 
-    def _extract_prediction(self, text, fundamental_metric):
+    def _extract_prediction(self, text):
         """
-        Extract the prediction and magnitude from the model's response.
+        Extract the implied volatility prediction from the model's response.
 
         Args:
             text: Text containing the model's response
-            fundamental_metric: The fundamental metric being predicted
 
         Returns:
-            Tuple of (prediction, magnitude) or (None, None) if extraction fails
+            The extracted IV as a string or None if extraction fails
         """
         # Check for thinking section
         think_tags = re.findall(r"<think>", text, re.IGNORECASE)
@@ -232,59 +269,60 @@ class OptionsIVPrediction(BaseEnv):
 
         # Verify thinking format - must have exactly one opening and one closing tag
         if len(think_tags) != 1 or len(think_close_tags) != 1:
-            return None, None
+            return None
 
         # Split on </think> to separate thinking from answer
         parts = re.split(r"</think>", text, flags=re.IGNORECASE, maxsplit=1)
         if len(parts) != 2:
-            return None, None
+            return None
 
         thinking_section, answer_section = parts
 
         # Validate thinking section contains opening tag
         if "<think>" not in thinking_section.lower():
-            return None, None
+            return None
 
-        # Escape fundamental_metric for regex
-        escaped_metric = re.escape(fundamental_metric)
-
-        # Extract prediction and magnitude using regex - dynamic to match the fundamental metric
-        pattern = f"The {escaped_metric} will be:\\s*(maintained|raised|reduced)\\s*and\\s*the\\s*magnitude\\s*will\\s*be:\\s*([-+]?\\d+(?:\\.\\d+)?)%"  # noqa E501
+        # Extract IV prediction using regex
+        pattern = r"The implied volatility will be:\s*([\d.]+%)"
 
         # Find all matches to check if there are multiple predictions
         all_matches = re.findall(pattern, answer_section, re.IGNORECASE)
 
         # If no matches or multiple matches found, return None
         if len(all_matches) != 1:
-            return None, None
+            return None
 
         # Extract single match
         matches = re.search(pattern, answer_section, re.IGNORECASE)
-        prediction = matches.group(1).lower()
-        magnitude = matches.group(2)
+        prediction = matches.group(1)
 
-        return prediction, magnitude
+        return prediction
 
-    def _calculate_magnitude_score(self, predicted_magnitude, expected_magnitude):
+    def _calculate_iv_score(self, predicted_iv, expected_iv):
         """
-        Calculate a score for magnitude prediction accuracy.
+        Calculate a score for IV prediction accuracy.
 
         Args:
-            predicted_magnitude: The model's predicted magnitude percentage
-            expected_magnitude: The expected magnitude percentage
+            predicted_iv: The model's predicted IV percentage
+            expected_iv: The expected IV percentage as a float
 
         Returns:
             Score between 0.0 and 1.0 based on how close the prediction is
         """
         try:
-            # Convert to float for comparison
-            pred_mag = float(predicted_magnitude)
-            exp_mag = float(expected_magnitude)
+            # Convert predicted percentage to float
+            if isinstance(predicted_iv, str) and "%" in predicted_iv:
+                pred_iv = float(predicted_iv.strip('%'))
+            else:
+                pred_iv = float(predicted_iv)
+            
+            # Expected IV is already a float
+            exp_iv = float(expected_iv)
 
             # Calculate absolute difference
-            diff = abs(pred_mag - exp_mag)
+            diff = abs(pred_iv - exp_iv)
 
-            # Score based on closeness to expected magnitude
+            # Score based on closeness to expected IV
             # Perfect match = 1.0
             # Within 1% = 0.9
             # Within 5% = 0.7
@@ -292,18 +330,20 @@ class OptionsIVPrediction(BaseEnv):
             # Within 20% = 0.3
             # More than 20% off = 0.0
 
-            if diff == 0:
+            if diff < 0.5:
                 return 1.0
-            elif diff <= 1:
-                return 0.9
+            elif diff <= 2:
+                return 0.95
             elif diff <= 5:
-                return 0.7
+                return 0.85
             elif diff <= 10:
+                return 0.7
+            elif diff <= 15:
                 return 0.5
             elif diff <= 20:
                 return 0.3
             else:
-                return 0.0
+                return 0.1
 
         except ValueError:
             # If conversion fails, return 0
@@ -313,7 +353,7 @@ class OptionsIVPrediction(BaseEnv):
         self, rollout_group_data
     ) -> Union[Optional[ScoredDataGroup], List[Optional[ScoredDataGroup]]]:
         """
-        Score the generated model responses for fundamental metric predictions.
+        Score the generated model responses for IV predictions.
 
         Args:
             rollout_group_data: List of generated responses with expected answers
@@ -326,12 +366,9 @@ class OptionsIVPrediction(BaseEnv):
         scores["masks"] = list()
         scores["scores"] = list()
 
-        # Get the expected answer, magnitude, and fundamental metric
-        expected_answer = rollout_group_data[0][
-            1
-        ]  # "maintained", "raised", or "reduced"
-        expected_magnitude = rollout_group_data[0][2]  # Expected percentage change
-        fundamental_metric = rollout_group_data[0][3]  # Type of fundamental metric
+        # Get the expected answer and raw IV
+        expected_answer = rollout_group_data[0][1]  # IV as percentage string
+        expected_raw_iv = rollout_group_data[0][2]  # Raw IV as float
 
         # Shuffle to avoid bias in selection
         random.shuffle(rollout_group_data)
@@ -340,24 +377,16 @@ class OptionsIVPrediction(BaseEnv):
             # Extract the model's response
             model_response = item[0][-1]["content"]
 
-            # Extract the prediction and magnitude from the model's response
-            prediction, magnitude = self._extract_prediction(
-                model_response, fundamental_metric
-            )
+            # Extract the prediction from the model's response
+            prediction = self._extract_prediction(model_response)
 
             # Calculate final score
             if prediction is None:
-                final_score = 0.0  # Invalid format
-            elif prediction == expected_answer:
-                # Correct direction: base score of 1 + magnitude bonus
-                magnitude_score = (
-                    self._calculate_magnitude_score(magnitude, expected_magnitude)
-                    if magnitude is not None
-                    else 0.0
-                )
-                final_score = 1.0 + magnitude_score
+                final_score = -0.5  # Invalid format
             else:
-                final_score = 0.0  # Incorrect direction
+                # Calculate IV accuracy score
+                iv_score = self._calculate_iv_score(prediction, expected_raw_iv)
+                final_score = iv_score
 
             # Apply length penalty for responses that are too long
             response_tokens = len(self.tokenizer.encode(model_response))
@@ -366,7 +395,7 @@ class OptionsIVPrediction(BaseEnv):
                 final_score -= 0.5 * (response_tokens / self.config.max_token_length)
 
             # For binary reward signal, any positive score gets +1, otherwise -1
-            binary_reward = 1.0 if final_score > 0 else -1.0
+            binary_reward = 1.0 if final_score > 0.5 else -1.0
 
             # Tokenize the conversation for learning
             out_dict = tokenize_for_trainer(self.tokenizer, item[0])
@@ -382,14 +411,18 @@ class OptionsIVPrediction(BaseEnv):
             scores["scores"].append(binary_reward)
 
             # For tracking metrics
-            directional_correct = (
-                1.0 if prediction == expected_answer and prediction is not None else 0.0
-            )
-            self.percent_correct_buffer.append(directional_correct)
-            if prediction == expected_answer and magnitude is not None:
-                self.magnitude_accuracy_buffer.append(
-                    self._calculate_magnitude_score(magnitude, expected_magnitude)
-                )
+            if prediction is not None:
+                try:
+                    pred_iv = float(prediction.strip('%'))
+                    accuracy = self._calculate_iv_score(pred_iv, expected_raw_iv)
+                    self.percent_correct_buffer.append(1.0 if accuracy >= 0.7 else 0.0)
+                    self.magnitude_accuracy_buffer.append(accuracy)
+                except ValueError:
+                    self.percent_correct_buffer.append(0.0)
+                    self.magnitude_accuracy_buffer.append(0.0)
+            else:
+                self.percent_correct_buffer.append(0.0)
+                self.magnitude_accuracy_buffer.append(0.0)
 
             # Break once we have enough examples
             if len(scores["tokens"]) >= self.config.group_size:
@@ -409,18 +442,15 @@ class OptionsIVPrediction(BaseEnv):
             test_item: Test item from dataset
 
         Returns:
-            Dictionary with direction and magnitude scores
+            Dictionary with IV prediction accuracy
         """
-        # Extract context, answer, magnitude and fundamental metric from the test item
+        # Extract context and answer from the test item
         context = test_item["context"]
         expected_answer = test_item["answer"]
-        expected_magnitude = test_item["magnitude"]
-        fundamental_metric = test_item["fundamental_metric"]
+        expected_raw_iv = test_item["raw_iv"]
 
-        # Format user message with context and fundamental metric
-        user_content = user_message_template.format(
-            context=context, fundamental_metric=fundamental_metric
-        )
+        # Format user message with context
+        user_content = user_message_template.format(context=context)
 
         # Create messages for model
         messages = [
@@ -445,30 +475,29 @@ class OptionsIVPrediction(BaseEnv):
         # Extract the model's response
         model_response = completion.choices[0].text
 
-        # Extract prediction and magnitude
-        prediction, magnitude = self._extract_prediction(
-            model_response, fundamental_metric
-        )
+        # Extract prediction
+        prediction = self._extract_prediction(model_response)
 
-        # Calculate direction score (1 for correct, 0 for incorrect)
-        direction_score = (
-            1 if prediction == expected_answer and prediction is not None else 0
-        )
+        # Calculate scores
+        format_score = 1 if prediction is not None else 0
+        
+        accuracy_score = 0
+        if prediction is not None:
+            try:
+                pred_iv = float(prediction.strip('%'))
+                accuracy_score = self._calculate_iv_score(pred_iv, expected_raw_iv)
+            except ValueError:
+                accuracy_score = 0
 
-        # Calculate magnitude score if direction is correct
-        magnitude_score = 0
-        if direction_score == 1 and magnitude is not None:
-            magnitude_score = self._calculate_magnitude_score(
-                magnitude, expected_magnitude
-            )
-
-        # Calculate combined score (1 + magnitude_score for correct direction, 0 for incorrect)
-        combined_score = (1 + magnitude_score) if direction_score == 1 else 0
+        # Binary score - correct if within 10% of actual IV
+        binary_score = 1 if accuracy_score >= 0.7 else 0
 
         return {
-            "direction_score": direction_score,
-            "magnitude_score": magnitude_score,
-            "combined_score": combined_score,
+            "format_score": format_score,
+            "accuracy_score": accuracy_score,
+            "binary_score": binary_score,
+            "predicted_iv": prediction if prediction is not None else "invalid",
+            "expected_iv": expected_answer,
         }
 
     async def evaluate(self, *args, **kwargs):
@@ -483,62 +512,40 @@ class OptionsIVPrediction(BaseEnv):
         all_scores = await tqdm_asyncio.gather(*eval_tasks)
 
         # Calculate aggregate metrics
-        direction_scores = [score["direction_score"] for score in all_scores]
-        magnitude_scores = [
-            score["magnitude_score"]
-            for score in all_scores
-            if score["direction_score"] == 1
-        ]
-        combined_scores = [score["combined_score"] for score in all_scores]
+        format_scores = [score["format_score"] for score in all_scores]
+        accuracy_scores = [score["accuracy_score"] for score in all_scores if score["format_score"] == 1]
+        binary_scores = [score["binary_score"] for score in all_scores]
 
         # Calculate and log metrics
-        direction_accuracy = (
-            sum(direction_scores) / len(direction_scores) if direction_scores else 0
-        )
-        magnitude_accuracy = (
-            sum(magnitude_scores) / len(magnitude_scores) if magnitude_scores else 0
-        )
-        average_combined_score = (
-            sum(combined_scores) / len(combined_scores) if combined_scores else 0
-        )
+        format_accuracy = sum(format_scores) / len(format_scores) if format_scores else 0
+        iv_accuracy = sum(accuracy_scores) / len(accuracy_scores) if accuracy_scores else 0
+        binary_accuracy = sum(binary_scores) / len(binary_scores) if binary_scores else 0
 
-        self.eval_metrics.append(("eval/direction_accuracy", direction_accuracy))
-        self.eval_metrics.append(("eval/magnitude_accuracy", magnitude_accuracy))
-        self.eval_metrics.append(("eval/combined_score", average_combined_score))
+        self.eval_metrics.append(("eval/format_accuracy", format_accuracy))
+        self.eval_metrics.append(("eval/iv_accuracy", iv_accuracy))
+        self.eval_metrics.append(("eval/binary_accuracy", binary_accuracy))
 
     async def wandb_log(self, wandb_metrics: Optional[Dict] = None):
         if wandb_metrics is None:
             wandb_metrics = {}
 
-        # Calculate and log training direction accuracy
+        # Calculate and log training format accuracy
         try:
-            direction_accuracy = sum(self.percent_correct_buffer) / len(
+            format_accuracy = sum(self.percent_correct_buffer) / len(
                 self.percent_correct_buffer
             )
-            wandb_metrics["train/direction_accuracy"] = direction_accuracy
+            wandb_metrics["train/format_accuracy"] = format_accuracy
         except ZeroDivisionError:
             pass  # Skip if buffer is empty
 
-        # Calculate and log training magnitude accuracy
+        # Calculate and log training IV accuracy
         try:
-            magnitude_accuracy = sum(self.magnitude_accuracy_buffer) / len(
+            iv_accuracy = sum(self.magnitude_accuracy_buffer) / len(
                 self.magnitude_accuracy_buffer
             )
-            wandb_metrics["train/magnitude_accuracy"] = magnitude_accuracy
+            wandb_metrics["train/iv_accuracy"] = iv_accuracy
         except ZeroDivisionError:
             pass  # Skip if buffer is empty
-
-        # Calculate combined training score (direction + magnitude)
-        try:
-            combined_score = (
-                direction_accuracy + magnitude_accuracy
-                if "direction_accuracy" in wandb_metrics
-                else 0
-            )
-            wandb_metrics["train/combined_score"] = combined_score
-        except Exception as e:
-            print(f"Error calculating combined score: {e}")
-            pass
 
         # Clear the buffers after logging
         self.percent_correct_buffer = list()
@@ -566,18 +573,14 @@ class OptionsIVPrediction(BaseEnv):
         if num_keep == -1:
             num_keep = self.config.group_size
 
-        # Get fundamental metric from item
-        fundamental_metric = item[3]
-
         # Add examples to rollouts
         self.rollouts_for_wandb.append(
             [
                 (
                     self.tokenizer.decode(scored_data["tokens"][i]),
                     scored_data["scores"][i],
-                    item[1],  # expected direction (maintained/raised/reduced)
-                    item[2],  # expected magnitude
-                    fundamental_metric,  # metric type being predicted
+                    item[1],  # expected IV as string
+                    item[2],  # expected IV as raw value
                 )
                 for i in range(min(num_keep, len(scored_data["tokens"])))
             ]
@@ -594,15 +597,14 @@ class OptionsIVPrediction(BaseEnv):
                 columns=[
                     "text",
                     "score",
-                    "expected_direction",
-                    "expected_magnitude",
-                    "fundamental_metric",
+                    "expected_iv_string",
+                    "expected_iv_raw",
                 ]
             )
 
             for group in self.rollouts_for_wandb:
                 for item in group:
-                    table.add_data(item[0], item[1], item[2], item[3], item[4])
+                    table.add_data(item[0], item[1], item[2], item[3])
 
             wandb_metrics["train/rollouts"] = table
 
